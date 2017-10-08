@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 
+	"github.com/eaburns/bit"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -51,6 +52,35 @@ type TrackJSON struct {
 	Title          string
 	Track_MBID     string
 	Track_Num      uint64
+}
+
+type BlockHeader struct {
+	LastBlock bool
+	Type      uint8
+	Length    int64
+}
+
+func parseBlockHeader(r io.Reader) (block *BlockHeader, err error) {
+	br := bit.NewReader(&io.LimitedReader{R: r, N: 32})
+	fields, err := br.ReadFields(1, 7, 24)
+	if err != nil {
+		return
+	}
+
+	return &BlockHeader{
+		LastBlock: fields[0] == 1,
+		Type:      uint8(fields[1]),
+		Length:    int64(fields[2]),
+	}, nil
+}
+
+func (b *BlockHeader) Marshal() []byte {
+	packed := []byte{b.Type, byte(b.Length >> 16), byte(b.Length >> 8), byte(b.Length)}
+	if b.LastBlock {
+		// set the last block flag bit to 1
+		packed[0] ^= 0x80
+	}
+	return packed
 }
 
 func loadTrackInfo(trackID string) (data *TrackJSON, err error) {
@@ -139,7 +169,9 @@ func trackHandler(w http.ResponseWriter, r *http.Request) {
 	// now that we've done the preliminary check, we can start writing a
 	// response
 	w.Header().Add("Content-Type", "audio/flac")
-	w.Write(magic)
+	if _, err = w.Write(magic); err != nil {
+		log.Printf("Failed to write response: %v\n", err)
+	}
 
 	// copy the STREAMINFO block; per the FLAC specification, the metadata
 	// block header is 0x4 bytes long and the STREAMINFO block itself is
@@ -147,6 +179,31 @@ func trackHandler(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.CopyN(w, resp.Body, 0x26); err != nil {
 		log.Printf("Unable to decode track: %v\n", err)
 		return
+	}
+
+	for {
+		block, err := parseBlockHeader(resp.Body)
+		if err != nil {
+			log.Printf("Failed to parse block header: %v\n", err)
+			return
+		}
+
+		// FIXME: remove this debugging code
+		log.Printf("Block: %v, %d, %d\n", block.LastBlock, block.Type, block.Length)
+
+		if _, err := w.Write(block.Marshal()); err != nil {
+			log.Printf("Failed to write response: %v\n", err)
+			return
+		}
+
+		if _, err := io.CopyN(w, resp.Body, block.Length); err != nil {
+			log.Printf("Unable to decode track: %v\n", err)
+			return
+		}
+
+		if block.LastBlock {
+			break
+		}
 	}
 
 	// TODO: walk through each METADATA block. we know when we're at the
